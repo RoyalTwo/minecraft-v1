@@ -1,10 +1,16 @@
 use std::f32::consts::PI;
 
-use bevy::{prelude::*, window::CursorGrabMode};
+use bevy::{prelude::*, transform::commands, window::CursorGrabMode};
 use bevy_fly_camera::{FlyCamera, FlyCameraPlugin};
+use bevy_mod_raycast::{
+    DefaultPluginState, DefaultRaycastingPlugin, Intersection, RaycastMesh, RaycastMethod,
+    RaycastSource, RaycastSystem,
+};
 
 #[derive(Component)]
 struct IsCamera;
+#[derive(Component)]
+struct IsBlock;
 #[derive(Component)]
 struct BlockID(i32);
 #[derive(Bundle)]
@@ -14,15 +20,23 @@ struct BlockBundle {
     #[bundle]
     pbr: PbrBundle,
 }
+#[derive(Clone, Reflect)]
+struct MyRaycastSet;
 
 fn main() {
     App::new()
         .add_plugins(DefaultPlugins)
+        .add_plugin(DefaultRaycastingPlugin::<MyRaycastSet>::default())
+        .add_system(
+            update_raycast_with_cursor
+                .in_base_set(CoreSet::First)
+                .before(RaycastSystem::BuildRays::<MyRaycastSet>),
+        )
         .insert_resource(ClearColor(Color::rgb(0.47, 0.91, 1.0)))
         .add_startup_system(setup)
         .add_system(lock_mouse)
+        .add_system(break_block)
         .add_plugin(FlyCameraPlugin)
-        .add_system(click_ray_cast)
         .run();
 }
 
@@ -32,17 +46,20 @@ fn setup(
     materials: ResMut<Assets<StandardMaterial>>,
     asset_server: Res<AssetServer>,
 ) {
-    commands.spawn((
-        Camera3dBundle {
-            transform: Transform::from_xyz(0.0, 2.0, 0.0),
-            ..Default::default()
-        },
-        IsCamera,
-        FlyCamera {
-            sensitivity: 10.0,
-            ..FlyCamera::default()
-        },
-    ));
+    commands.insert_resource(DefaultPluginState::<MyRaycastSet>::default().with_debug_cursor());
+    commands
+        .spawn((
+            Camera3dBundle {
+                transform: Transform::from_xyz(0.0, 2.0, 0.0),
+                ..Default::default()
+            },
+            IsCamera,
+            FlyCamera {
+                sensitivity: 10.0,
+                ..FlyCamera::default()
+            },
+        ))
+        .insert(RaycastSource::<MyRaycastSet>::new()); // Make this mesh ray cast-able
     commands.spawn(DirectionalLightBundle {
         directional_light: DirectionalLight {
             shadows_enabled: true,
@@ -68,7 +85,12 @@ fn lock_mouse(
     let mut window = window.single_mut();
 
     if mouse.just_pressed(MouseButton::Left) {
-        window.cursor.visible = false;
+        let window_dimensions = Vec2 {
+            x: window.width() / 2.0,
+            y: window.height() / 2.0,
+        };
+        window.set_cursor_position(Some(window_dimensions));
+        // window.cursor.visible = false;
         window.cursor.grab_mode = CursorGrabMode::Locked;
     }
 
@@ -78,36 +100,54 @@ fn lock_mouse(
     }
 }
 
-fn click_ray_cast(
+fn update_raycast_with_cursor(
+    mut cursor: EventReader<CursorMoved>,
+    mut query: Query<&mut RaycastSource<MyRaycastSet>>,
+) {
+    // Grab the most recent cursor event if it exists:
+    let cursor_position = match cursor.iter().last() {
+        Some(cursor_moved) => cursor_moved.position,
+        None => return,
+    };
+
+    for mut pick_source in &mut query {
+        pick_source.cast_method = RaycastMethod::Screenspace(cursor_position);
+    }
+}
+
+fn break_block(
     mouse: Res<Input<MouseButton>>,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
-    mut query: Query<(&Transform, With<IsCamera>)>,
+    query: Query<&Intersection<MyRaycastSet>>,
+    blocks: Query<(&Transform, Entity), With<IsBlock>>,
     mut commands: Commands,
 ) {
-    let cam = query.single_mut();
-    let cam = cam.0;
-    let cam_pos = cam.translation;
-
-    let mut ray_transform = Transform::from_xyz(cam_pos.x, cam_pos.y, cam_pos.z);
-    ray_transform.rotation = cam.rotation;
     if mouse.just_pressed(MouseButton::Left) {
-        let ray_phys = PbrBundle {
-            mesh: meshes.add(Mesh::from(shape::Cube { size: 2.0 })),
-            material: materials.add(StandardMaterial {
-                base_color: Color::Rgba {
-                    red: 1.0,
-                    green: 0.0,
-                    blue: 0.0,
-                    alpha: 1.0,
-                },
-                ..Default::default()
-            }),
-            transform: ray_transform,
-            ..Default::default()
-        };
-        commands.spawn(ray_phys);
-        info!("Clicked");
+        for intersection in &query {
+            if let Some(pos) = intersection.position() {
+                for (transform, entity) in blocks.iter() {
+                    let block_pos = transform.translation;
+
+                    let inter_coords = Vec3::new(pos.x + 0.5, pos.y - 0.5, pos.z + 0.5);
+                    let inter_after_floor = (
+                        inter_coords.x.floor(),
+                        inter_coords.y.floor(),
+                        inter_coords.z.floor(),
+                    );
+                    if inter_after_floor.0 == block_pos.x
+                        && inter_after_floor.1 == block_pos.y
+                        && inter_after_floor.2 == block_pos.z
+                    {
+                        info!("Block: {:?}", block_pos);
+                        commands.entity(entity).despawn();
+                    } else {
+                        warn!(
+                            "E Inter {:?} Block Inter {:?}",
+                            inter_after_floor, block_pos
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -150,6 +190,8 @@ fn generate_temp_chunk(
 
 fn spawn_temp_chunk(blocks: Vec<BlockBundle>, mut commands: Commands) {
     for block in blocks {
-        commands.spawn(block);
+        commands
+            .spawn((block, IsBlock))
+            .insert(RaycastMesh::<MyRaycastSet>::default()); // Make this mesh ray cast-able
     }
 }
